@@ -11,6 +11,10 @@ replays missed events on reconnect, sends delivery/read receipts, sends typing e
 resumable media transfer. If you replace the three fakes in `AppContainer` with real network clients,
 nothing above the data layer changes. See [§1.2 Mock server](#12-the-mock-server).
 
+Security is built in, not just described: the database is encrypted (SQLCipher with a Keystore-wrapped
+key), downloaded media is integrity-checked, all network input is validated, and backups exclude
+chats. Everything is listed with its trade-offs in [§16](#16-security--privacy-measures-and-trade-offs).
+
 <p align="center">
   <img src="docs/screenshots/01_chat_list.png" width="200" alt="Chat list" />
   <img src="docs/screenshots/03_ticks_and_replies.png" width="200" alt="Ticks and replies" />
@@ -40,6 +44,7 @@ nothing above the data layer changes. See [§1.2 Mock server](#12-the-mock-serve
 13. [Likely follow-up questions & crisp answers](#13-likely-follow-up-questions)
 14. [What's real vs simulated; production gaps](#14-whats-real-vs-simulated)
 15. [Project structure](#15-project-structure)
+16. [**Security & privacy: every measure and its trade-off**](#16-security--privacy-measures-and-trade-offs)
 
 ---
 
@@ -133,6 +138,8 @@ interview shows you validate in real conditions:
    row through a single-row Room `Flow` (which registers before querying, so it can't miss the final
    write). The cost is bounded: only *visible* (lazy) bubbles with unsettled media subscribe, and
    settled messages cost nothing. See `MessageBubble`.
+3. **Security bugs found the same way**: the encrypted-DB migration crashed on launch, and its error
+   log leaked the encryption key into logcat. See [§16.5](#165-lessons-from-verifying-security-on-a-device).
 
 ---
 
@@ -544,7 +551,7 @@ table kept in sync via triggers. WAL is enabled so the UI reads while sync write
 - With E2EE the server can't put plaintext in the push. Either encrypt the payload with session keys
   (decrypted on device), or send a content-free tickle and fetch.
 
-### 10.10 Security & privacy (talk track, not implemented here)
+### 10.10 Security & privacy (summary; full detail in [§16](#16-security--privacy-measures-and-trade-offs))
 - **Signal protocol**: X3DH for the initial key agreement using prekeys uploaded to the server, then
   the **Double Ratchet** for forward secrecy and post-compromise security. Groups use **Sender Keys**
   (one encryption per message, not one per member).
@@ -601,6 +608,10 @@ table kept in sync via triggers. WAL is enabled so the UI reads while sync write
 | UI | Compose + UDF | Views/RecyclerView | Modern, less code, testable state | — |
 | Image loading | Coil 3 | Glide | Kotlin/coroutines-first, Compose-native | — |
 | Auto-download | Images always, video Wi-Fi | Always / never | Data cost vs UX (matches WhatsApp defaults) | Make user-configurable |
+| DB at rest | SQLCipher + Keystore-wrapped key | Rely on Android file-based encryption only | Protects on rooted/compromised/unlocked devices and in backups, not just a locked phone | APK size or perf budget tight and threat model is "lost locked phone" only |
+| Backups | Exclude chats/media/keys | OS auto-backup | Private comms; Keystore key isn't restorable anyway | Ship app-level E2E-encrypted backup |
+| Network input | Strict allowlist validation, drop + advance cursor | Trust server | Peer/server may be hostile | Add "unsupported message, update app" placeholder for forward-compat |
+| Media integrity | SHA-256 + size in message, verify after download | Trust CDN/TLS | CDN or MITM can't swap bytes; corrupted files never reach decoders | E2EE → also per-file AES key + HMAC |
 
 ---
 
@@ -718,13 +729,16 @@ platform media/background APIs native. The fakes become shared test fixtures.
 query, sync cursor in the same transaction, idempotent insert, ref-counted connection lifecycle
 with backoff + jitter, default-network monitoring, WorkManager uploads/downloads with unique work
 and retries, resumable chunk logic, image downscale/EXIF/micro-thumbnail, Photo Picker, Paging 3
-with separators, in-memory progress, visibility-gated read receipts, ExoPlayer viewer.
+with separators, in-memory progress, visibility-gated read receipts, ExoPlayer viewer. **Security**: SQLCipher DB
+encryption with a Keystore-wrapped key and an atomic plaintext→encrypted migration, wire validation,
+path confinement, media SHA-256 integrity, backup exclusions, network security config, and opt-in
+`FLAG_SECURE` (§16).
 
 **Simulated**: the server (`FakeChatServer`), the WebSocket (`FakeChatTransport`), and the CDN
 (`FakeMediaStore`), all in-process. The contacts are bots that echo media back so the receive path
 gets exercised.
 
-**Known gaps you should name before the interviewer does**: no E2EE; no FCM/notifications; no
+**Known gaps you should name before the interviewer does**: no E2EE (§16.4); no auth; no FCM/notifications; no
 video transcoding; no ack-timeout resend on a live connection; read receipts are best-effort (they'd
 need their own outbox); no groups/multi-device; no `setForeground` for big uploads; no message
 search/edit/delete; manual DI; single module.
@@ -747,14 +761,119 @@ app/src/main/java/com/example/whatsapp/
 │   ├── network/NetworkMonitor.kt # default-network tracking + "simulate offline"
 │   ├── sync/                     # ConnectionManager, SyncEngine, BackoffPolicy, OutboxWorker
 │   └── media/                    # MediaProcessor, ImageSizing, TransferScheduler, workers, progress
+├── security/                     # WireValidation (+ path confinement, sha256), DatabaseKeyProvider, SecuritySettings
 └── ui/
     ├── AppNavHost.kt
-    ├── chatlist/                 # list + "Simulate offline" toggle
+    ├── chatlist/                 # list + "Simulate offline" / "Screen security" toggles
     ├── chat/                     # paging, day headers, bubbles, ticks, composer, photo picker
     ├── media/                    # full-screen image, ExoPlayer video
     ├── common/                   # avatar, ticks, formatting
     └── theme/
-app/src/test/…                    # FakeChatServerTest, BackoffPolicyTest, MessageStatusTest, ImageSizingTest
+app/src/test/…                    # FakeChatServerTest, SecurityTest, BackoffPolicyTest, MessageStatusTest, ImageSizingTest
+app/src/main/res/xml/             # backup + data-extraction rules, network_security_config
 app/schemas/                      # exported Room schema (migration review/testing)
 docs/screenshots/                 # screenshots used in this README (captured from the running app)
 ```
+
+---
+
+## 16. Security & privacy: measures and trade-offs
+
+> **Interview framing:** start from the threat model, defend in layers, and say what each control
+> *costs*. A control without a stated trade-off sounds like a checklist, not engineering judgment.
+
+### 16.1 Threat model
+
+| # | Attacker | Example | Primary defences |
+|---|---|---|---|
+| T1 | Network attacker | Public Wi-Fi, hostile carrier, rogue CA | TLS, cleartext ban, cert pinning, E2EE, media hash |
+| T2 | Curious or compromised server/CDN | Insider, breach, subpoena, swapped blobs | **E2EE** (§16.4); media SHA-256 (done) |
+| T3 | Malicious peer | Crafted message ID, oversized or odd media, decoder exploits | Wire validation, path confinement, MIME allowlist, size limits, bounded decoding |
+| T4 | Physical / local access | Lost phone, rooted device, forensic image, backup extraction | DB encryption, Keystore, backup exclusions, screen security, app lock |
+| T5 | Other apps on the device | Exported components, overlays, clipboard, shared storage | No exported components, private storage, Photo Picker, OS overlay protections |
+| T6 | Modified client / bots | Spam, scraping, account takeover | Server-side auth, rate limits, Play Integrity as a risk signal |
+
+### 16.2 Implemented in this repo (and how each was verified)
+
+| # | Measure | Where | Threat | Verified by |
+|---|---|---|---|---|
+| 1 | **DB encryption at rest**: SQLCipher (AES-256, per-page HMAC) | [`AppDatabase`](app/src/main/java/com/example/whatsapp/data/local/AppDatabase.kt) | T4 | On device: file header is random bytes, not `SQLite format 3`; the `sqlite3` CLI reports *"file is not a database"* |
+| 2 | **Envelope key management**: a random 256-bit passphrase, stored only wrapped by a non-exportable **Android Keystore** AES-GCM key (StrongBox if available, else TEE) | [`DatabaseKeyProvider`](app/src/main/java/com/example/whatsapp/security/DatabaseKeyProvider.kt) | T4 | Cold restart unwraps it and reopens the DB, with no crash; the prefs file only holds ciphertext |
+| 3 | **Atomic plaintext → encrypted migration** for existing installs (`sqlcipher_export` into a temp file, rename, then delete the plaintext; Room's 1→2 `AutoMigration` runs afterwards) | `AppDatabase.migrateLegacyPlaintext` | T4 | On device, using a seeded **v1 plaintext DB**: its message survived, the plaintext file was deleted, and the schema was upgraded |
+| 4 | **Key-loss recovery**: if the Keystore key is gone (restore onto a new device, OEM reset), wipe and re-sync instead of crash-looping | `AppDatabase.create` | Availability | By construction; see the trade-off below |
+| 5 | **Wire validation**: message IDs must be UUIDs; conversation/sender IDs must be slugs; MIME allowlist per type (no SVG etc.); limits on size, dimensions, thumbnail and text; media must carry a SHA-256 | [`WireValidation`](app/src/main/java/com/example/whatsapp/security/WireValidation.kt), `SyncEngine` | T2, T3 | [`SecurityTest`](app/src/test/java/com/example/whatsapp/SecurityTest.kt) (traversal IDs, `image/svg+xml`, oversized payloads, missing hash) |
+| 6 | **Path confinement**: every network-derived file name goes through `childSafely()` (canonical path must stay inside the directory); extensions are never derived from MIME strings | Download worker, `MediaProcessor`, `FakeMediaStore` | T3 | Unit tests: `../escape.jpg`, `../../etc/passwd`, `sub/dir.jpg`, `..` are all rejected |
+| 7 | **Poison-frame isolation**: a malformed frame is dropped (and the cursor advanced so it isn't replayed forever) without killing the sync loop | `SyncEngine.start/apply` | T2, T3 (DoS) | Code path covered by the validation tests |
+| 8 | **Media integrity**: the sender computes SHA-256 and the size and puts them in the message; the receiver verifies after downloading, and on a mismatch deletes the file, marks it FAILED and offers retry | `MediaProcessor`, `MediaDownloadWorker` | T1, T2 | On device: I **tampered with the CDN blob** (appended bytes) and the download was rejected, with no file kept and the blurred thumbnail plus a retry button shown ([screenshot](docs/screenshots/13_tampered_media_rejected.png)) |
+| 9 | **Backups exclude** the DB, media, CDN cache and the wrapped key, for both cloud backup and device-to-device transfer (API 31+ and legacy rules) | [`data_extraction_rules.xml`](app/src/main/res/xml/data_extraction_rules.xml), [`backup_rules.xml`](app/src/main/res/xml/backup_rules.xml) | T4 | Config review |
+| 10 | **Network security config**: cleartext banned, system CAs only; user CAs allowed **only in debug** (for proxy debugging); pinning template with a backup pin and an expiry | [`network_security_config.xml`](app/src/main/res/xml/network_security_config.xml) | T1 | Config review (the backend is in-process, so pins aren't active) |
+| 11 | **EXIF stripping** (GPS, device model) by re-encoding outgoing photos | `MediaProcessor` | Privacy | On device: the source JPEG had an EXIF block, the sent file has none |
+| 12 | **Opt-in screen security**: `FLAG_SECURE` (blocks screenshots, screen recording and casting) plus a blank Recents thumbnail on API 33+, applied before the first frame | [`SecuritySettings`](app/src/main/java/com/example/whatsapp/security/SecuritySettings.kt), `MainActivity`, ⋮ menu | T4, shoulder-surfing | On device: `screencap` returned **0 bytes** when on and a normal screenshot when off |
+| 13 | **Minimal permissions**: only `INTERNET` and `ACCESS_NETWORK_STATE`; media through the **Photo Picker** (no storage permission) | Manifest, `ChatScreen` | T5 | Manifest review |
+| 14 | **No exported components** except the launcher activity; WorkManager workers aren't exported | Manifest | T5 | Manifest review |
+| 15 | **SQL injection impossible by construction**: Room binds every parameter; the one raw statement (the migration `ATTACH`) uses bound parameters | DAOs, `AppDatabase` | T3 | Code review |
+| 16 | **Log hygiene**: no IDs, content or keys in logs (`SyncEngine` logs reasons only) | `SyncEngine`, `AppDatabase` | T4, T5 | On device: grepped logcat for key material and found 0 matches (see §16.5 for the leak this caught) |
+| 17 | **Bounded decoding**: `inSampleSize` + downscaling caps bitmap memory, which defuses decompression bombs | `MediaProcessor`, `ImageSizing` | T3 | `ImageSizingTest` |
+| 18 | **R8** shrinking and optimization for release | `app/build.gradle.kts` | Reverse engineering (a speed bump only) | Build config |
+
+### 16.3 Trade-offs of what's implemented
+
+| Decision | Cost / downside | Why it's still right here / alternative |
+|---|---|---|
+| **SQLCipher** on top of Android's file-based encryption (FBE) | Measured: +2.0 MB native library on arm64 (7.3 MB uncompressed across 4 ABIs in a universal APK; Play's per-ABI splits ship only one), ~5–15% slower queries, a slower first open (key derivation) | FBE only protects a **locked or powered-off** device. SQLCipher also covers root, sandbox escape, forensic images and backup extraction on an unlocked device. If the threat model is "lost locked phone", FBE alone is defensible and many apps stop there; say that explicitly |
+| **Keystore-bound key, not exportable** | Losing the key means losing the local history (restore to a new phone, factory reset, rare OEM Keystore bugs) | Recover by **wiping and re-syncing** (done) plus an app-level E2EE backup (roadmap). Exportable keys would defeat the purpose |
+| Key **not** tied to user authentication (`setUserAuthenticationRequired` is off) | A thief with an *unlocked* phone can open the app | Background sync and notifications must read the DB while the screen is locked. Offer an opt-in **biometric app lock** instead (roadmap) |
+| Key unwrapped **at startup on the main thread** | Adds a Keystore round-trip (~10–50 ms) to cold start | Simple and deterministic. In production, open the DB lazily off the main thread and measure with Macrobenchmark |
+| **Excluding chats from backups** | Switching phones loses history unless you build your own backup | Private messages shouldn't silently land in a cloud account, and a restored DB is unreadable anyway (measure 2). Ship E2E-encrypted backups with a user-held key |
+| **Strict allowlist validation** (drop unknown MIME types etc.) | **Forward-compatibility risk**: a newer server sending `image/avif` would have its messages dropped by old clients, silently for now | Safety first. Production should render "This message isn't supported, update the app" instead of dropping it, and negotiate capabilities in `Hello` |
+| **Advance the cursor past poison frames** | One bad event is skipped rather than retried | Blocking the cursor would stall *all* sync forever (self-inflicted DoS). Production should also emit telemetry so the server-side bug gets fixed |
+| **Hash verification** of every download | One extra full read of the file (CPU and battery, roughly ms per MB) | Cheap compared with the download itself. With E2EE the HMAC check makes this mandatory anyway |
+| **FLAG_SECURE opt-in** rather than forced | The default leaves screenshots possible | Forcing it hurts legitimate uses (sharing, reporting abuse, accessibility, screen readers on some OEMs) and can't stop a second camera. Signal uses the same opt-in model; WhatsApp forces it only for view-once media |
+| **Debug builds trust user CAs** | A debug build on a compromised device could be MITM'd | Essential for proxy debugging; release builds can't do it (`debug-overrides`) |
+| **Pinning not enabled** | Nothing is pinned right now | Pinning can **brick every installed client** if keys rotate unexpectedly. It needs backup pins, an expiry, and ideally a remote kill switch. Turn it on once the backend's key rotation process is owned |
+
+### 16.4 Not implemented: production roadmap, with trade-offs
+
+| Measure | What it would take | Trade-off to mention |
+|---|---|---|
+| **End-to-end encryption** (Signal protocol: X3DH + Double Ratchet; **Sender Keys** for groups; safety numbers) | libsignal, a prekey server, a sessions/identity store in the encrypted DB, key-change UX | The server can no longer **search, moderate, scan for spam or abuse, or preview links**, and push payloads must be encrypted. Multi-device and backups get much harder. It's the single biggest architectural decision, so plan it as its own milestone with an external audit |
+| **Media encryption** (per-file AES-256-CBC + HMAC-SHA256 key, sent inside the E2E message) | Encrypt before upload, decrypt after verifying the hash | The CDN can't dedupe identical media across users (WhatsApp keeps dedupe on forwards by reusing the same key). Decrypting also costs CPU, and seeking in video gets harder |
+| **Authentication** (phone OTP, registration-lock PIN, device-bound short-lived tokens with refresh rotation; wipe on logout) | Auth service, Keystore-backed token storage (Tink with DataStore; `security-crypto` is deprecated) | SMS OTP is vulnerable to SIM swap, so add a registration lock. Shorter token lifetimes add more refresh traffic |
+| **Certificate pinning** (SPKI pins plus a backup, expiry, remote kill switch) | Uncomment the `network_security_config` pin-set | Risk of bricking clients (above) |
+| **Play Integrity API** | Server verifies a token on register and on sensitive calls | False positives on custom ROMs. Use it as a **risk signal** (rate limits, extra checks), never a hard block |
+| **Biometric app lock** | `BiometricPrompt` and an auth-bound key for the UI | Extra friction, and notifications must then hide content |
+| **Notification privacy** | `VISIBILITY_PRIVATE` with a redacted public version; never put message text in the push payload | A less informative lock screen |
+| **Encrypt media files at rest** | Tink streaming AEAD over `files/media` | Seeking in video and the CPU cost of thumbnail generation. FBE already covers the locked-device case |
+| **Disappearing / view-once messages** | Timers in the DB plus deletion, and forced `FLAG_SECURE` for view-once | Be honest: flash wear-levelling and the recipient's camera mean deletion is **best effort**, not a guarantee |
+| **Abuse resistance** | Server-side rate limits, block/report, spam heuristics on metadata | With E2EE these work on **metadata and user reports**, not content |
+| **Supply chain** | Gradle `verification-metadata.xml`, Renovate/Dependabot, SBOM, reviewing SDKs that touch message data | Verification metadata adds friction to every dependency bump |
+| **Hardening extras** | `EXTRA_IS_SENSITIVE` for copied OTPs/keys (API 33+), `filterTouchesWhenObscured` on confirm dialogs, a lint rule that bans logging message fields | Small costs; Android 12+ already blocks touches from untrusted overlays |
+| **Root / tamper detection** | Integrity signals | Easily bypassed and causes false positives. Use it only as a risk signal |
+
+### 16.5 Lessons from verifying security on a device
+
+These are worth telling in an interview because they show that security code also needs real-device testing:
+
+1. **`ATTACH` inherits the main connection's open flags.** The plaintext DB was opened `READWRITE`
+   without `CREATE`, so SQLCipher couldn't create the encrypted target and the app crashed on
+   launch. Unit tests can't catch this because it needs the native library.
+2. **The error log printed the encryption key.** When that statement failed, SQLite's error log
+   printed the full `ATTACH … KEY '<passphrase>'` text to logcat. The fix was to pass the path and
+   key as **bound parameters** and to re-verify with a logcat grep (0 matches). General rule:
+   secrets never go into SQL text, exception messages, or analytics.
+3. **An empty target file would have caused data loss.** A stray 0-byte `chat_secure.db` would have
+   made the migration think it was already done and delete the plaintext DB. It now treats an empty
+   target as "not migrated", and exports to a temp file followed by an atomic rename.
+
+### 16.6 Talk track (60 seconds)
+
+> "I start with the threat model: network, server, malicious peer, physical access, other apps,
+> modified clients. Transport is TLS with cleartext banned; pinning needs backup pins, an expiry and
+> a kill switch because it can brick clients. Everything off the wire is validated against
+> allowlists, and file paths are confined, because a message ID is attacker input. Media carries a
+> SHA-256 that the receiver verifies, so a CDN can't swap content. At rest, the DB is SQLCipher
+> with a Keystore-wrapped key, which covers more than file-based encryption does (rooted devices,
+> backups), at a cost of a few MB and some query overhead. Backups exclude chats until we ship
+> E2E-encrypted backups. The big roadmap item is **E2EE with the Signal protocol**: it removes the
+> server from the trust base, but we give up server-side search, moderation and link previews, and
+> multi-device gets hard. That's a product decision, not just an engineering one."

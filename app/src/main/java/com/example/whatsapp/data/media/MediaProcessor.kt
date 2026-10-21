@@ -9,6 +9,8 @@ import android.net.Uri
 import androidx.core.graphics.scale
 import androidx.exifinterface.media.ExifInterface
 import com.example.whatsapp.domain.model.MessageType
+import com.example.whatsapp.security.childSafely
+import com.example.whatsapp.security.sha256Hex
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -24,6 +26,7 @@ class PreparedMedia(
     val height: Int,
     val durationMs: Long?,
     val microThumbnail: ByteArray,
+    val sha256: String,
 )
 
 class MediaTooLargeException(val limitBytes: Long) : IOException("Media exceeds ${limitBytes / (1024 * 1024)} MB")
@@ -71,7 +74,7 @@ class MediaProcessor(
         val scaled = if (targetW != sampled.width) sampled.scale(targetW, targetH) else sampled
         val upright = scaled.rotate(rotation)
 
-        val file = File(mediaDir, "$messageId.jpg")
+        val file = mediaDir.childSafely("$messageId.jpg")
         file.outputStream().use { upright.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, it) }
         val thumb = upright.microThumbnail()
 
@@ -83,6 +86,7 @@ class MediaProcessor(
             height = upright.height,
             durationMs = null,
             microThumbnail = thumb,
+            sha256 = file.sha256Hex(),
         )
     }
 
@@ -101,8 +105,9 @@ class MediaProcessor(
             val duration = meta(MediaMetadataRetriever.METADATA_KEY_DURATION)
             val frame = retriever.getFrameAtTime(0) ?: throw IOException("Unreadable video")
 
-            val extension = if (mime == "video/mp4") "mp4" else mime.substringAfter('/', "mp4")
-            val file = File(mediaDir, "$messageId.$extension")
+            // Never derive a file extension from the (content-provider supplied) MIME string.
+            val extension = if (mime == "video/webm") "webm" else "mp4"
+            val file = mediaDir.childSafely("$messageId.$extension")
             context.contentResolver.openInputStream(uri).use { input ->
                 file.outputStream().use { output -> input?.copyTo(output) ?: throw IOException("Unreadable video") }
             }
@@ -115,6 +120,7 @@ class MediaProcessor(
                 height = height,
                 durationMs = duration,
                 microThumbnail = frame.microThumbnail(),
+                sha256 = file.sha256Hex(),
             )
         } finally {
             retriever.release()

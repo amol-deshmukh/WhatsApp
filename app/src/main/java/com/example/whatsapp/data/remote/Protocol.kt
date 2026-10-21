@@ -19,6 +19,8 @@ class MediaPayload(
     val durationMs: Long?,
     val sizeBytes: Long,
     val microThumbnail: ByteArray?,
+    /** Hash of the blob; the receiver verifies the downloaded bytes against it (CDN can't swap content). */
+    val sha256: String?,
 )
 
 sealed interface ClientFrame {

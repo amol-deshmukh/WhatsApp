@@ -52,10 +52,12 @@ import com.example.whatsapp.ui.common.label
 fun ChatListRoute(onOpenChat: (String) -> Unit) {
     val container = LocalContext.current.appContainer
     val viewModel = viewModel {
-        ChatListViewModel(container.chatRepository, container.connectionManager.state, container.networkMonitor)
+        ChatListViewModel(
+            container.chatRepository, container.connectionManager.state, container.networkMonitor, container.securitySettings,
+        )
     }
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    ChatListScreen(state, onOpenChat, viewModel::setSimulateOffline)
+    ChatListScreen(state, onOpenChat, viewModel::setSimulateOffline, viewModel::setScreenSecurity)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -64,6 +66,7 @@ fun ChatListScreen(
     state: ChatListUiState,
     onOpenChat: (String) -> Unit,
     onSimulateOfflineChange: (Boolean) -> Unit,
+    onScreenSecurityChange: (Boolean) -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -74,7 +77,9 @@ fun ChatListScreen(
                         state.connection.label()?.let { Text(it, style = MaterialTheme.typography.labelMedium) }
                     }
                 },
-                actions = { OverflowMenu(state.simulateOffline, onSimulateOfflineChange) },
+                actions = {
+                    OverflowMenu(state.simulateOffline, onSimulateOfflineChange, state.screenSecurity, onScreenSecurityChange)
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -99,7 +104,12 @@ fun ChatListScreen(
 }
 
 @Composable
-private fun OverflowMenu(simulateOffline: Boolean, onChange: (Boolean) -> Unit) {
+private fun OverflowMenu(
+    simulateOffline: Boolean,
+    onChange: (Boolean) -> Unit,
+    screenSecurity: Boolean,
+    onScreenSecurityChange: (Boolean) -> Unit,
+) {
     var expanded by remember { mutableStateOf(false) }
     IconButton(onClick = { expanded = true }) {
         Icon(Icons.Default.MoreVert, contentDescription = "More options")
@@ -109,6 +119,11 @@ private fun OverflowMenu(simulateOffline: Boolean, onChange: (Boolean) -> Unit) 
             text = { Text("Simulate offline") },
             trailingIcon = { Checkbox(checked = simulateOffline, onCheckedChange = null) },
             onClick = { onChange(!simulateOffline); expanded = false },
+        )
+        DropdownMenuItem(
+            text = { Text("Screen security") },
+            trailingIcon = { Checkbox(checked = screenSecurity, onCheckedChange = null) },
+            onClick = { onScreenSecurityChange(!screenSecurity); expanded = false },
         )
     }
 }

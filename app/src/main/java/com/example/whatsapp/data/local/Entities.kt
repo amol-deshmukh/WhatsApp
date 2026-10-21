@@ -62,6 +62,7 @@ data class MessageEntity(
     @ColumnInfo(name = "media_size_bytes") val mediaSizeBytes: Long = 0,
     @ColumnInfo(name = "media_micro_thumb", typeAffinity = ColumnInfo.BLOB) val mediaMicroThumb: ByteArray? = null,
     @ColumnInfo(name = "transfer_state") val transferState: TransferState = TransferState.NONE,
+    @ColumnInfo(name = "media_sha256") val mediaSha256: String? = null,
 )
 
 /** Single-row table holding the sync cursor: the highest server sequence number applied locally. */

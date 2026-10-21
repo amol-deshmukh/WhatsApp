@@ -5,6 +5,8 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.whatsapp.ChatApplication
 import com.example.whatsapp.domain.model.TransferState
+import com.example.whatsapp.security.childSafely
+import com.example.whatsapp.security.sha256Hex
 import java.io.File
 import java.io.IOException
 
@@ -63,11 +65,24 @@ class MediaDownloadWorker(context: Context, params: WorkerParameters) : Coroutin
         val url = message.mediaRemoteUrl ?: return Result.failure()
 
         val extension = if (message.mediaMime?.startsWith("video/") == true) "mp4" else "jpg"
-        val destination = File(container.mediaProcessor.mediaDir, "$messageId.$extension")
+        // messageId came off the wire: validated in SyncEngine, and the path is confined here too.
+        val destination = try {
+            container.mediaProcessor.mediaDir.childSafely("$messageId.$extension")
+        } catch (e: IOException) {
+            dao.setTransferState(messageId, TransferState.FAILED)
+            return Result.failure()
+        }
 
         dao.setTransferState(messageId, TransferState.DOWNLOADING)
         return try {
             container.mediaStore.download(url, destination) { progress.update(messageId, it) }
+            // Integrity: the bytes must match the hash and size the sender put in the message.
+            // A CDN/MITM can't substitute content, and a corrupted transfer is never shown or parsed.
+            if (destination.length() != message.mediaSizeBytes || destination.sha256Hex() != message.mediaSha256) {
+                destination.delete()
+                dao.setTransferState(messageId, TransferState.FAILED)
+                return Result.failure()
+            }
             dao.setDownloaded(messageId, destination.absolutePath)
             Result.success()
         } catch (e: IOException) {

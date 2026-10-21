@@ -100,6 +100,7 @@ class ChatRepository(
                 mediaDurationMs = prepared.durationMs,
                 mediaSizeBytes = prepared.file.length(),
                 mediaMicroThumb = prepared.microThumbnail,
+                mediaSha256 = prepared.sha256,
                 transferState = TransferState.UPLOAD_PENDING,
             )
         )
@@ -107,8 +108,16 @@ class ChatRepository(
     }
 
     suspend fun retry(messageId: String) {
-        messageDao.resetForRetry(messageId)
         val message = messageDao.get(messageId) ?: return
+        if (!message.isOutgoing) {
+            // Incoming media that failed (e.g. integrity check): fetch it again.
+            if (message.transferState == TransferState.FAILED) {
+                messageDao.setTransferState(messageId, TransferState.DOWNLOAD_AVAILABLE)
+                transfers.enqueueDownload(messageId)
+            }
+            return
+        }
+        messageDao.resetForRetry(messageId)
         if (message.type != MessageType.TEXT && message.mediaRemoteUrl == null) transfers.enqueueUpload(messageId)
     }
 

@@ -1,6 +1,8 @@
 package com.example.whatsapp.data.remote.fake
 
 import com.example.whatsapp.data.remote.MediaStore
+import com.example.whatsapp.security.WireValidation
+import com.example.whatsapp.security.childSafely
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -27,7 +29,7 @@ class FakeMediaStore(
 
     override suspend fun upload(uploadId: String, file: File, onProgress: (Float) -> Unit): String =
         withContext(ioDispatcher) {
-            val partial = File(partialDir, uploadId)
+            val partial = partialDir.childSafely(uploadId)
             val total = file.length()
             // "Query upload status": the server tells us how many bytes it already has.
             var offset = partial.length().coerceAtMost(total)
@@ -46,14 +48,16 @@ class FakeMediaStore(
                     }
                 }
             }
-            val finalFile = File(root, uploadId)
+            val finalFile = root.childSafely(uploadId)
             if (!partial.renameTo(finalFile)) throw IOException("Failed to finalize upload $uploadId")
             "$SCHEME$uploadId"
         }
 
     override suspend fun download(remoteUrl: String, destination: File, onProgress: (Float) -> Unit) =
         withContext(ioDispatcher) {
-            val source = File(root, remoteUrl.removePrefix(SCHEME))
+            val objectId = remoteUrl.removePrefix(SCHEME)
+            if (!remoteUrl.startsWith(SCHEME) || !WireValidation.isMessageId(objectId)) throw IOException("Bad URL")
+            val source = root.childSafely(objectId)
             if (!source.exists()) throw IOException("404: $remoteUrl")
             val partial = File(destination.path + ".part")
             val total = source.length()

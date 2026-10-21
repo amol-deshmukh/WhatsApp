@@ -21,6 +21,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import android.util.Log
+import com.example.whatsapp.security.WireValidation
+import kotlinx.coroutines.CancellationException
 import java.io.IOException
 
 /**
@@ -40,6 +43,10 @@ class SyncEngine(
     private val networkStatus: StateFlow<NetworkStatus>,
     private val scope: CoroutineScope,
 ) {
+    private companion object {
+        const val TAG = "SyncEngine"
+    }
+
     private val messageDao = db.messageDao()
     private val syncStateDao = db.syncStateDao()
 
@@ -48,7 +55,18 @@ class SyncEngine(
     val typing: StateFlow<Set<String>> = _typing.asStateFlow()
 
     fun start() {
-        scope.launch { transport.frames.collect { apply(it) } }
+        scope.launch {
+            transport.frames.collect { frame ->
+                // One malformed or hostile frame must not kill the sync loop for the session.
+                try {
+                    apply(frame)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Dropping frame ${frame::class.simpleName}: ${e.javaClass.simpleName}")
+                }
+            }
+        }
         scope.launch { drainOutboxWhileConnected() }
     }
 
@@ -82,6 +100,12 @@ class SyncEngine(
             is ServerFrame.Ack -> messageDao.markAcked(frame.clientMessageId, frame.seq)
 
             is ServerFrame.NewMessage -> {
+                WireValidation.rejectReason(frame)?.let { reason ->
+                    // Still advance the cursor: otherwise the server would replay the poison event forever.
+                    db.withTransaction { advanceCursor(frame.seq) }
+                    Log.w(TAG, "Rejected message: $reason") // no ids/content in logs
+                    return
+                }
                 val inserted = db.withTransaction {
                     val rowId = messageDao.insert(frame.toEntity())
                     advanceCursor(frame.seq)
@@ -93,9 +117,11 @@ class SyncEngine(
                 _typing.update { it - frame.conversationId }
             }
 
-            is ServerFrame.StatusChanged -> db.withTransaction {
+            is ServerFrame.StatusChanged -> if (WireValidation.isMessageId(frame.messageId)) db.withTransaction {
                 messageDao.advanceStatus(frame.messageId, frame.status.rank)
                 advanceCursor(frame.seq)
+            } else {
+                db.withTransaction { advanceCursor(frame.seq) }
             }
 
             is ServerFrame.TypingChanged -> _typing.update {
@@ -133,6 +159,7 @@ class SyncEngine(
                 durationMs = mediaDurationMs,
                 sizeBytes = mediaSizeBytes,
                 microThumbnail = mediaMicroThumb,
+                sha256 = mediaSha256,
             )
         },
     )
@@ -154,6 +181,7 @@ class SyncEngine(
         mediaDurationMs = media?.durationMs,
         mediaSizeBytes = media?.sizeBytes ?: 0,
         mediaMicroThumb = media?.microThumbnail,
+        mediaSha256 = media?.sha256,
         transferState = if (media != null) TransferState.DOWNLOAD_AVAILABLE else TransferState.NONE,
     )
 }

@@ -15,6 +15,7 @@ import com.example.whatsapp.data.remote.fake.FakeChatTransport
 import com.example.whatsapp.data.remote.fake.FakeMediaStore
 import com.example.whatsapp.data.sync.ConnectionManager
 import com.example.whatsapp.data.sync.SyncEngine
+import com.example.whatsapp.security.SecuritySettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,6 +34,8 @@ class AppContainer(context: Context) {
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     val database: AppDatabase = AppDatabase.create(context)
+
+    val securitySettings = SecuritySettings(context)
 
     val networkMonitor = NetworkMonitor(context, appScope)
     private val isOnline = { networkMonitor.status.value.isOnline }
