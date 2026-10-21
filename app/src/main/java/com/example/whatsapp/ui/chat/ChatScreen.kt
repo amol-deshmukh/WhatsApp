@@ -93,6 +93,7 @@ fun ChatRoute(conversationId: String, onBack: () -> Unit, onOpenMedia: (String) 
             MessageBubble(
                 message = message,
                 progressOf = viewModel::transferProgress,
+                observeMessage = viewModel::observeMessage,
                 onRetry = viewModel::retry,
                 onDownload = viewModel::download,
                 onOpenMedia = onOpenMedia,

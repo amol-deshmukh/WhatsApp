@@ -138,4 +138,6 @@ class ChatViewModel(
     fun download(messageId: String) = repository.download(messageId)
 
     fun transferProgress(messageId: String): Flow<Float?> = repository.transferProgress(messageId)
+
+    fun observeMessage(messageId: String): Flow<Message?> = repository.message(messageId)
 }

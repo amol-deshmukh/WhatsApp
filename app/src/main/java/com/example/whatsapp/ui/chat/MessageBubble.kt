@@ -57,6 +57,26 @@ import java.io.File
 fun MessageBubble(
     message: Message,
     progressOf: (String) -> Flow<Float?>,
+    observeMessage: (String) -> Flow<Message?>,
+    onRetry: (String) -> Unit,
+    onDownload: (String) -> Unit,
+    onOpenMedia: (String) -> Unit,
+) {
+    // Room's PagingSource can miss an invalidation when a write lands during its initial load
+    // (seen on-device: a finished download kept showing a spinner until the chat was reopened).
+    // While a transfer is in flight, also observe this one row directly — a single-row Flow
+    // registers before it queries, so it can't miss the final write. Cost: one observer per
+    // *visible* unsettled media bubble (lazy list), none for settled messages.
+    val inFlight = message.media?.transferState.let { it != null && it != TransferState.NONE }
+    val liveFlow = remember(message.id, inFlight) { if (inFlight) observeMessage(message.id) else flowOf(null) }
+    val live by liveFlow.collectAsStateWithLifecycle(initialValue = null)
+    MessageBubbleContent(live ?: message, progressOf, onRetry, onDownload, onOpenMedia)
+}
+
+@Composable
+private fun MessageBubbleContent(
+    message: Message,
+    progressOf: (String) -> Flow<Float?>,
     onRetry: (String) -> Unit,
     onDownload: (String) -> Unit,
     onOpenMedia: (String) -> Unit,

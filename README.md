@@ -9,13 +9,23 @@ emulator with no infrastructure. The fake server still behaves like a real one i
 for client design: it keeps an ordered event log with sequence numbers, dedupes sends idempotently,
 replays missed events on reconnect, sends delivery/read receipts, sends typing events, and supports
 resumable media transfer. If you replace the three fakes in `AppContainer` with real network clients,
-nothing above the data layer changes.
+nothing above the data layer changes. See [§1.2 Mock server](#12-the-mock-server).
+
+<p align="center">
+  <img src="docs/screenshots/01_chat_list.png" width="200" alt="Chat list" />
+  <img src="docs/screenshots/03_ticks_and_replies.png" width="200" alt="Ticks and replies" />
+  <img src="docs/screenshots/05_offline_outbox_pending.png" width="200" alt="Offline outbox" />
+  <img src="docs/screenshots/08_video_tap_to_download_on_cellular.png" width="200" alt="Video download policy" />
+</p>
 
 ---
 
 ## Table of contents
 
-1. [Run it & 2-minute demo script](#1-run-it--2-minute-demo-script)
+1. [Run it & 2-minute demo script](#1-run-it--2-minute-demo-script) ·
+   [Screenshots](#11-screenshots-captured-on-an-api-32-emulator) ·
+   [Mock server](#12-the-mock-server) ·
+   [Bugs found on device](#13-bugs-found-by-running-it-on-a-device-great-interview-stories)
 2. [How to drive the interview (45–60 min)](#2-how-to-drive-the-interview-4560-min)
 3. [Requirements](#3-requirements)
 4. [Back-of-the-envelope numbers](#4-back-of-the-envelope-numbers)
@@ -49,10 +59,80 @@ Media3 ExoPlayer, Coil 3, Navigation Compose. minSdk 24, targetSdk 37.
 |---|---|---|
 | 1 | Open *Alice* and send "hi" | Optimistic UI: the bubble appears instantly with 🕓, then ✓ (server ack), ✓✓ (delivered), blue ✓✓ (read). The header shows *typing…* and then a reply arrives. |
 | 2 | ⋮ → **Simulate offline**, then send 3 messages | The outbox: messages persist as PENDING and the header says *waiting for connection…* |
-| 3 | Kill the app (swipe away), reopen, still offline | Durability: the outbox is in SQLite, not in memory. |
+| 3 | While offline, kill the app (swipe away) and reopen it | Durability: the queued messages are still there and send on launch, because the outbox is in SQLite, not in memory. (The *Simulate offline* toggle itself is in memory, so it resets to online on restart.) |
 | 4 | Turn **Simulate offline** off | Reconnect with backoff, `Hello(lastSeq)`, the outbox drains, and the server dedupes. Receipts and replies that the server produced while you were offline are replayed in order. |
 | 5 | Tap ➕ and pick a photo | Client-side compression, a micro-thumbnail, a WorkManager upload with a progress ring, and the message is sent only after the upload finishes. The bot echoes the photo back, so the receive path auto-downloads it. |
 | 6 | Pick a video, go offline mid-upload, go back online | Resumable chunked upload continues from the last byte. Incoming videos follow the Wi-Fi-only auto-download policy, otherwise you get a tap-to-download button. |
+
+On Android 13+ ➕ opens the system Photo Picker. On older versions the same API falls back to the
+system document picker, so no storage permission is needed on any version.
+
+### 1.1 Screenshots (captured on an API 32 emulator)
+
+All screenshots below were taken from this app running against the in-process mock server.
+
+**Text chat: optimistic send, receipts, typing**
+
+| Chat list | Contact is typing | ✓ → ✓✓ → blue ✓✓, replies |
+|---|---|---|
+| <img src="docs/screenshots/01_chat_list.png" width="240"/> | <img src="docs/screenshots/02_typing_indicator.png" width="240"/> | <img src="docs/screenshots/03_ticks_and_replies.png" width="240"/> |
+| Last-message preview (🎥 for video), unread badge. The *Design Review Bot* reply arrived after the chat was closed, so it stays unread (receipts are visibility-gated). | `TypingChanged` is an **ephemeral** frame. It's never stored in Room or replayed. | Status only moves forward (enforced in SQL). Day header comes from `insertSeparators`. |
+
+**Offline-first: outbox, then reconnect and drain**
+
+| Debug toggle | Offline: everything queued | List while offline | After reconnect |
+|---|---|---|---|
+| <img src="docs/screenshots/04_simulate_offline_menu.png" width="190"/> | <img src="docs/screenshots/05_offline_outbox_pending.png" width="190"/> | <img src="docs/screenshots/06_list_waiting_for_network.png" width="190"/> | <img src="docs/screenshots/07_reconnected_outbox_drained_photo_echo.png" width="190"/> |
+| ⋮ → *Simulate offline* cuts the transport and the "CDN". | Texts sit as 🕓 PENDING. The photo is compressed, stored locally, and waiting for upload (spinner). The header says *waiting for connection…* | `ConnectionManager` state reaches the UI as "Waiting for network…" | `Hello(lastSeq)` → replay → outbox drains → upload resumes → **photo sent only after the upload** → bot echoes it → auto-download. |
+
+**Media: auto-download policy, download, viewers**
+
+| Video on cellular | Downloading | Ready | Image viewer | Video (ExoPlayer) |
+|---|---|---|---|---|
+| <img src="docs/screenshots/08_video_tap_to_download_on_cellular.png" width="150"/> | <img src="docs/screenshots/09_video_downloading.png" width="150"/> | <img src="docs/screenshots/10_video_downloaded.png" width="150"/> | <img src="docs/screenshots/11_image_viewer.png" width="150"/> | <img src="docs/screenshots/12_video_player_exoplayer.png" width="150"/> |
+| On a **metered** network, video isn't auto-downloaded. The blurred **micro-thumbnail** that came inline with the message renders instantly, plus duration and a "⬇ 825 KB" button. | Resumable download worker. Progress comes from the in-memory tracker, not Room. | Local file. Frame rendered by Coil's video decoder. | Full-screen `AsyncImage`. | Player created per file and released in `onDispose`. |
+
+Measured on the device: a 764 KB, 3000 px JPEG became **~185 KB** at 1600 px after the client-side
+downscale and re-encode (about −75% upload bytes). Re-encoding also drops all EXIF data, including
+any GPS location.
+
+### 1.2 The mock server
+
+There's no backend to deploy. Three fakes in `data/remote/fake/` stand in for it, behind the same
+interfaces a real implementation would use:
+
+| Fake | Replaces (production) | Behaviour it simulates faithfully |
+|---|---|---|
+| [`FakeChatServer`](app/src/main/java/com/example/whatsapp/data/remote/fake/FakeChatServer.kt) | Gateway + chat service + inbox log | **Idempotent sends** (same `clientMessageId` → same seq, processed once). **Per-user ordered event log** with monotonic `seq`. **Replay after cursor** on `Hello(lastSeq)` followed by `SyncComplete`. Events produced while you're offline are buffered. Contacts are **bots** that send DELIVERED, then READ, then *typing…*, then a reply, and echo your media back so the receive and download path gets exercised. Session IDs mean a stale disconnect can't kill a newer connection. |
+| [`FakeChatTransport`](app/src/main/java/com/example/whatsapp/data/remote/fake/FakeChatTransport.kt) | OkHttp WebSocket | Handshake latency, per-frame latency, an abrupt socket drop when the network goes away, and `IOException` on send to a closed socket. |
+| [`FakeMediaStore`](app/src/main/java/com/example/whatsapp/data/remote/fake/FakeMediaStore.kt) | CDN / object store (GCS/S3 resumable) | **Chunked, resumable** upload and download (resume from the bytes already persisted, the same contract as `Content-Range`/`Range`). Fails mid-transfer when offline. Blobs live in `filesDir/fake_cdn`, and URLs look like `fakecdn://<id>`. |
+
+The server contract is unit-tested in
+[`FakeChatServerTest`](app/src/test/java/com/example/whatsapp/FakeChatServerTest.kt): duplicate sends
+are acked with the same seq and only one reply is produced; offline events are replayed in seq order
+after the cursor; and a stale detach doesn't drop a newer session.
+
+**Swapping in a real backend** touches only [`AppContainer`](app/src/main/java/com/example/whatsapp/di/AppContainer.kt):
+implement `ChatTransport` with an OkHttp `WebSocketListener` (Protobuf frames) and `MediaStore` with
+resumable HTTPS. `SyncEngine`, `ConnectionManager`, the DB, and all UI stay unchanged.
+
+### 1.3 Bugs found by running it on a device (great interview stories)
+
+Unit tests passed, and both of these still only showed up on a device. Telling either story in an
+interview shows you validate in real conditions:
+
+1. **Wi-Fi → cellular handover left the app "offline".** `NetworkMonitor` originally used
+   `registerNetworkCallback`, which reports *every* network. When Wi-Fi dropped, `onLost` read
+   `activeNetwork` before the system had promoted cellular, and the already-validated cellular
+   network never fired again. **Fix:** `registerDefaultNetworkCallback`, which tracks only the
+   network the system actually routes traffic over.
+2. **A finished download sometimes kept showing its spinner** until the chat was reopened.
+   Instrumentation showed the DB row was correct and that, in normal runs, a fresh PagingSource
+   emitted it, so the stale frame was a timing race between a write and the PagingSource's
+   invalidation registration. **Fix:** bubbles with an in-flight transfer also observe their own
+   row through a single-row Room `Flow` (which registers before querying, so it can't miss the final
+   write). The cost is bounded: only *visible* (lazy) bubbles with unsettled media subscribe, and
+   settled messages cost nothing. See `MessageBubble`.
 
 ---
 
@@ -676,4 +756,5 @@ app/src/main/java/com/example/whatsapp/
     └── theme/
 app/src/test/…                    # FakeChatServerTest, BackoffPolicyTest, MessageStatusTest, ImageSizingTest
 app/schemas/                      # exported Room schema (migration review/testing)
+docs/screenshots/                 # screenshots used in this README (captured from the running app)
 ```
