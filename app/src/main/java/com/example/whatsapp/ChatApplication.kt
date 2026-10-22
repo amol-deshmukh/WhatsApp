@@ -1,6 +1,8 @@
 package com.example.whatsapp
 
 import android.app.Application
+import android.os.StrictMode
+import androidx.tracing.trace
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -19,7 +21,8 @@ class ChatApplication : Application(), SingletonImageLoader.Factory {
 
     override fun onCreate() {
         super.onCreate()
-        container = AppContainer(this)
+        if (BuildConfig.DEBUG) enableStrictMode()
+        container = trace("ChatApplication.createContainer") { AppContainer(this) }
         container.appScope.launch { container.chatRepository.seedIfEmpty() }
         container.connectionManager.start()
         container.syncEngine.start()
@@ -42,6 +45,19 @@ class ChatApplication : Application(), SingletonImageLoader.Factory {
                 if (unsent > 0) container.transferScheduler.enqueueOutboxFlush()
             }
         }
+    }
+
+    /** Debug only: logs main-thread disk/network access and leaked closeables, which are jank and leak sources. */
+    private fun enableStrictMode() {
+        StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder().detectAll().penaltyLog().build())
+        StrictMode.setVmPolicy(
+            StrictMode.VmPolicy.Builder()
+                .detectLeakedClosableObjects()
+                .detectLeakedSqlLiteObjects()
+                .detectActivityLeaks()
+                .penaltyLog()
+                .build()
+        )
     }
 
     override fun newImageLoader(context: PlatformContext): ImageLoader =

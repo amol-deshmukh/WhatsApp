@@ -5,6 +5,9 @@ import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.PagingData
 import androidx.paging.map
+import androidx.room.withTransaction
+import androidx.tracing.trace
+import com.example.whatsapp.BuildConfig
 import com.example.whatsapp.data.local.AppDatabase
 import com.example.whatsapp.data.local.ConversationEntity
 import com.example.whatsapp.data.local.MessageEntity
@@ -40,7 +43,7 @@ class ChatRepository(
     private val conversationDao = db.conversationDao()
 
     fun conversations(): Flow<List<Conversation>> =
-        conversationDao.observeConversations().map { rows -> rows.map { it.toDomain() } }
+        conversationDao.observeConversations().map { rows -> trace("ChatList.mapRows") { rows.map { it.toDomain() } } }
 
     fun conversationTitle(id: String): Flow<String> =
         conversationDao.observe(id).map { it?.title.orEmpty() }.distinctUntilChanged()
@@ -138,9 +141,60 @@ class ChatRepository(
                 ConversationEntity("design-review", "Design Review Bot", 0xFF81C784, now - 2),
             )
         )
+        seedPerfDataset(now)
     }
+
+    /**
+     * Benchmark builds only: a deterministic large dataset (one long chat plus many conversations),
+     * so scrolling, paging and the conversation-list query are measured under realistic load.
+     * Written in a single transaction: one fsync instead of thousands.
+     */
+    private suspend fun seedPerfDataset(now: Long) {
+        val messageCount = BuildConfig.PERF_SEED_MESSAGES
+        val conversationCount = BuildConfig.PERF_SEED_CONVERSATIONS
+        if (messageCount == 0 && conversationCount == 0) return
+        db.withTransaction {
+            conversationDao.insertAll(
+                listOf(ConversationEntity(PERF_CONVERSATION_ID, "Perf Load Test", 0xFFFFB74D, now + 1)) +
+                    (1..conversationCount).map { i ->
+                        ConversationEntity("contact-$i", "Contact %02d".format(i), 0xFF000000 or (i * 0x2F3B5L % 0xFFFFFF), now - 10 - i)
+                    }
+            )
+            (1..conversationCount).forEach { i ->
+                messageDao.insert(seedMessage("contact-$i", i, incoming = i % 3 != 0, createdAt = now - i * 60_000L))
+            }
+            repeat(messageCount) { i ->
+                // Oldest first, one message every ~37s, alternating senders with varied lengths.
+                val createdAt = now - (messageCount - i) * 37_000L
+                messageDao.insert(seedMessage(PERF_CONVERSATION_ID, i, incoming = (i / 3) % 2 == 0, createdAt))
+            }
+        }
+    }
+
+    private fun seedMessage(conversationId: String, i: Int, incoming: Boolean, createdAt: Long) = MessageEntity(
+        id = UUID.nameUUIDFromBytes("$conversationId-$i".toByteArray()).toString(),
+        conversationId = conversationId,
+        senderId = if (incoming) conversationId else ME,
+        isOutgoing = !incoming,
+        type = MessageType.TEXT,
+        text = PERF_TEXTS[i % PERF_TEXTS.size] + " #$i",
+        createdAt = createdAt,
+        serverSeq = i.toLong(),
+        status = MessageStatus.READ.rank,
+    )
 
     companion object {
         const val ME = "me"
+        const val PERF_CONVERSATION_ID = "perf-load"
+        private val PERF_TEXTS = listOf(
+            "ok",
+            "Sounds good, see you at 5",
+            "Can you share the latest numbers from the dashboard before the review?",
+            "Here's the plan:\n1. Ship the fix behind a flag\n2. Ramp to 5%\n3. Watch crash-free and p95 send latency",
+            "😂😂😂",
+            "Long message to exercise multi-line layout and text measurement. " +
+                "Bubbles with several lines are the expensive case for LazyColumn item measurement, " +
+                "especially while flinging through history that Paging is loading in the background.",
+        )
     }
 }

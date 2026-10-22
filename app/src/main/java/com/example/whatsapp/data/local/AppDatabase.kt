@@ -5,6 +5,7 @@ import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.tracing.trace
 import com.example.whatsapp.security.DatabaseKeyProvider
 import net.zetetic.database.sqlcipher.SQLiteDatabase
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
@@ -31,13 +32,16 @@ abstract class AppDatabase : RoomDatabase() {
          * than crash-looping.
          */
         fun create(context: Context, keys: DatabaseKeyProvider = DatabaseKeyProvider(context)): AppDatabase {
-            System.loadLibrary("sqlcipher")
-            val passphrase = try {
-                keys.getOrCreatePassphrase()
-            } catch (e: DatabaseKeyProvider.KeyUnavailableException) {
-                keys.destroy()
-                context.deleteDatabase(DB_NAME)
-                keys.getOrCreatePassphrase()
+            // Both run on the main thread at startup; traced so the startup benchmark measures their cost.
+            trace("Security.loadSqlcipher") { System.loadLibrary("sqlcipher") }
+            val passphrase = trace("Security.keyUnwrap") {
+                try {
+                    keys.getOrCreatePassphrase()
+                } catch (e: DatabaseKeyProvider.KeyUnavailableException) {
+                    keys.destroy()
+                    context.deleteDatabase(DB_NAME)
+                    keys.getOrCreatePassphrase()
+                }
             }
             migrateLegacyPlaintext(context, passphrase)
             return Room.databaseBuilder(context, AppDatabase::class.java, DB_NAME)

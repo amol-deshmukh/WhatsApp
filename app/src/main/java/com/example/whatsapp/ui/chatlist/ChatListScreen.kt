@@ -1,5 +1,6 @@
 package com.example.whatsapp.ui.chatlist
 
+import androidx.activity.compose.ReportDrawnWhen
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +37,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -57,6 +59,8 @@ fun ChatListRoute(onOpenChat: (String) -> Unit) {
         )
     }
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    // Startup "time to full display" = the moment real conversations are on screen (not the spinner).
+    ReportDrawnWhen { !state.isLoading && state.conversations.isNotEmpty() }
     ChatListScreen(state, onOpenChat, viewModel::setSimulateOffline, viewModel::setScreenSecurity)
 }
 
@@ -94,7 +98,7 @@ fun ChatListScreen(
             }
             return@Scaffold
         }
-        LazyColumn(Modifier.fillMaxSize().padding(padding)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding).testTag("conversation_list")) {
             items(state.conversations, key = { it.id }) { conversation ->
                 ConversationRow(conversation, onClick = { onOpenChat(conversation.id) })
                 HorizontalDivider(Modifier.padding(start = 76.dp))
@@ -135,6 +139,7 @@ private fun ConversationRow(conversation: Conversation, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
+            .testTag("conversation_row")
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

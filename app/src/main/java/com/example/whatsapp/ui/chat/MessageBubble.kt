@@ -36,6 +36,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
@@ -87,6 +88,7 @@ private fun MessageBubbleContent(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .testTag("message_row")
             .padding(horizontal = 8.dp, vertical = 2.dp),
         horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start,
     ) {

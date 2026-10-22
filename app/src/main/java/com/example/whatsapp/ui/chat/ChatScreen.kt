@@ -48,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -156,7 +157,7 @@ fun ChatScreen(
             state = listState,
             reverseLayout = true,
             contentPadding = PaddingValues(vertical = 8.dp),
-            modifier = Modifier.fillMaxSize().padding(padding),
+            modifier = Modifier.fillMaxSize().padding(padding).testTag("messages_list"),
         ) {
             items(
                 count = messages.itemCount,
@@ -204,7 +205,7 @@ private fun Composer(onSend: (String) -> Unit, onAttach: () -> Unit) {
                 focusedIndicatorColor = Color.Transparent,
                 unfocusedIndicatorColor = Color.Transparent,
             ),
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f).testTag("composer_input"),
         )
         Spacer(Modifier.width(6.dp))
         FilledIconButton(
@@ -214,7 +215,7 @@ private fun Composer(onSend: (String) -> Unit, onAttach: () -> Unit) {
             },
             enabled = text.isNotBlank(),
             shape = CircleShape,
-            modifier = Modifier.padding(bottom = 4.dp),
+            modifier = Modifier.padding(bottom = 4.dp).testTag("send_button"),
         ) {
             Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
         }

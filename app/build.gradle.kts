@@ -18,6 +18,10 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Size of the synthetic dataset seeded on first launch (0 = normal demo data only).
+        buildConfigField("int", "PERF_SEED_MESSAGES", "0")
+        buildConfigField("int", "PERF_SEED_CONVERSATIONS", "0")
     }
 
     buildTypes {
@@ -27,6 +31,15 @@ android {
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
         }
+        // Release-like (minified, non-debuggable) build that the macrobenchmarks run against.
+        // Seeds a large deterministic dataset so scroll/paging/startup are measured under load.
+        create("benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            buildConfigField("int", "PERF_SEED_MESSAGES", "2000")
+            buildConfigField("int", "PERF_SEED_CONVERSATIONS", "60")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -34,6 +47,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -56,6 +70,8 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.tracing.ktx)
+    implementation(libs.androidx.profileinstaller)
 
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import android.util.Log
+import androidx.tracing.Trace
 import com.example.whatsapp.security.WireValidation
 import kotlinx.coroutines.CancellationException
 import java.io.IOException
@@ -59,7 +60,7 @@ class SyncEngine(
             transport.frames.collect { frame ->
                 // One malformed or hostile frame must not kill the sync loop for the session.
                 try {
-                    apply(frame)
+                    traceAsync("SyncEngine.applyFrame") { apply(frame) }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -94,6 +95,22 @@ class SyncEngine(
             }
         }
     }
+
+    /**
+     * Times one frame end-to-end (validation + DB transaction). A suspending, cookie-based async
+     * section, because the DB write may resume on another thread.
+     */
+    private inline fun traceAsync(name: String, block: () -> Unit) {
+        val cookie = nextTraceCookie++
+        Trace.beginAsyncSection(name, cookie)
+        try {
+            block()
+        } finally {
+            Trace.endAsyncSection(name, cookie)
+        }
+    }
+
+    private var nextTraceCookie = 0
 
     private suspend fun apply(frame: ServerFrame) {
         when (frame) {

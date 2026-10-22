@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Perfetto traces are large (~1 MB each); keep *benchmarkData.json + device.txt only.
+perf/results/**/*.perfetto-trace

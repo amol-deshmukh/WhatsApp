@@ -14,6 +14,8 @@ nothing above the data layer changes. See [§1.2 Mock server](#12-the-mock-serve
 Security is built in, not just described: the database is encrypted (SQLCipher with a Keystore-wrapped
 key), downloaded media is integrity-checked, all network input is validated, and backups exclude
 chats. Everything is listed with its trade-offs in [§16](#16-security--privacy-measures-and-trade-offs).
+Performance is measured, not asserted: a Macrobenchmark suite with a CI regression gate covers startup,
+scroll jank, paging and live traffic ([§17](#17-performance-budgets-measurement-and-trade-offs)).
 
 <p align="center">
   <img src="docs/screenshots/01_chat_list.png" width="200" alt="Chat list" />
@@ -45,6 +47,7 @@ chats. Everything is listed with its trade-offs in [§16](#16-security--privacy-
 14. [What's real vs simulated; production gaps](#14-whats-real-vs-simulated)
 15. [Project structure](#15-project-structure)
 16. [**Security & privacy: every measure and its trade-off**](#16-security--privacy-measures-and-trade-offs)
+17. [**Performance: budgets, macrobenchmarks, regression gate, trade-offs**](#17-performance-budgets-measurement-and-trade-offs)
 
 ---
 
@@ -75,6 +78,8 @@ system document picker, so no storage permission is needed on any version.
 ### 1.1 Screenshots (captured on an API 32 emulator)
 
 All screenshots below were taken from this app running against the in-process mock server.
+To regenerate the core ones (01–07), unlock a device and run
+`ANDROID_SERIAL=<serial> docs/capture-screenshots.sh`.
 
 **Text chat: optimistic send, receipts, typing**
 
@@ -574,7 +579,7 @@ table kept in sync via triggers. WAL is enabled so the UI reads while sync write
   recipient (client-fanout), and also to its *own* other devices so they see sent messages.
 - Read state syncs across devices via "self" events.
 
-### 10.13 Performance & quality
+### 10.13 Performance & quality (summary; budgets, benchmarks and measured results in [§17](#17-performance-budgets-measurement-and-trade-offs))
 - **Startup**: Baseline Profiles + Macrobenchmark for cold start; lazy init in `AppContainer`;
   App Startup library to order initializers.
 - **Compose**: stable/immutable UI models, `key` + `contentType` in lazy lists, collect progress
@@ -771,6 +776,9 @@ app/src/main/java/com/example/whatsapp/
     └── theme/
 app/src/test/…                    # FakeChatServerTest, SecurityTest, BackoffPolicyTest, MessageStatusTest, ImageSizingTest
 app/src/main/res/xml/             # backup + data-extraction rules, network_security_config
+benchmark/                        # :benchmark Macrobenchmark module (startup, scroll jank, paging, live traffic)
+perf/                             # run-benchmarks.sh, compare.py (CI regression gate), README, results/<release>/
+docs/capture-screenshots.sh       # reproducible README screenshots; docs/sample-media/ holds the test photo
 app/schemas/                      # exported Room schema (migration review/testing)
 docs/screenshots/                 # screenshots used in this README (captured from the running app)
 ```
@@ -823,7 +831,7 @@ docs/screenshots/                 # screenshots used in this README (captured fr
 | **SQLCipher** on top of Android's file-based encryption (FBE) | Measured: +2.0 MB native library on arm64 (7.3 MB uncompressed across 4 ABIs in a universal APK; Play's per-ABI splits ship only one), ~5–15% slower queries, a slower first open (key derivation) | FBE only protects a **locked or powered-off** device. SQLCipher also covers root, sandbox escape, forensic images and backup extraction on an unlocked device. If the threat model is "lost locked phone", FBE alone is defensible and many apps stop there; say that explicitly |
 | **Keystore-bound key, not exportable** | Losing the key means losing the local history (restore to a new phone, factory reset, rare OEM Keystore bugs) | Recover by **wiping and re-syncing** (done) plus an app-level E2EE backup (roadmap). Exportable keys would defeat the purpose |
 | Key **not** tied to user authentication (`setUserAuthenticationRequired` is off) | A thief with an *unlocked* phone can open the app | Background sync and notifications must read the DB while the screen is locked. Offer an opt-in **biometric app lock** instead (roadmap) |
-| Key unwrapped **at startup on the main thread** | Adds a Keystore round-trip (~10–50 ms) to cold start | Simple and deterministic. In production, open the DB lazily off the main thread and measure with Macrobenchmark |
+| Key unwrapped **at startup on the main thread** | Measured on the emulator: **43 ms** Keystore unwrap + **67 ms** SQLCipher native-library load on the cold-start main thread (§17.4) | Simple and deterministic. In production, open the DB lazily off the main thread and measure with Macrobenchmark |
 | **Excluding chats from backups** | Switching phones loses history unless you build your own backup | Private messages shouldn't silently land in a cloud account, and a restored DB is unreadable anyway (measure 2). Ship E2E-encrypted backups with a user-held key |
 | **Strict allowlist validation** (drop unknown MIME types etc.) | **Forward-compatibility risk**: a newer server sending `image/avif` would have its messages dropped by old clients, silently for now | Safety first. Production should render "This message isn't supported, update the app" instead of dropping it, and negotiate capabilities in `Hello` |
 | **Advance the cursor past poison frames** | One bad event is skipped rather than retried | Blocking the cursor would stall *all* sync forever (self-inflicted DoS). Production should also emit telemetry so the server-side bug gets fixed |
@@ -877,3 +885,132 @@ These are worth telling in an interview because they show that security code als
 > E2E-encrypted backups. The big roadmap item is **E2EE with the Signal protocol**: it removes the
 > server from the trust base, but we give up server-side search, moderation and link previews, and
 > multi-device gets hard. That's a product decision, not just an engineering one."
+
+---
+
+## 17. Performance: budgets, measurement and trade-offs
+
+> **Interview framing:** "I don't claim it's fast; I show the budget, the benchmark that guards it,
+> and the gate that stops a regression from shipping."
+
+### 17.1 Budgets (what "fast enough" means)
+
+| Area | Budget (mid-tier phone) | Guarded by |
+|---|---|---|
+| Cold start | TTID < 1 s, **TTFD < 1.5 s** (real conversations on screen). Android vitals flags cold ≥ 5 s, warm ≥ 2 s, hot ≥ 1.5 s as excessive | `startupCold` / `startupWarm` (`StartupTimingMetric` + `ReportDrawnWhen`) |
+| Scrolling | **`frameOverrunMs` P90 ≤ 0** (no missed deadlines), P99 small; no slice > 100 ms on the main thread | `conversationListScrollJank`, `chatHistoryScrollJank` (`FrameTimingMetric`) |
+| Live traffic | Applying one server frame (validate + DB txn) ≪ one frame budget; no jank while messages arrive | `liveMessagesInOpenChat` (`applyFrameAvg/Max`, frame metrics) |
+| Responsiveness | Main-thread slices > 100 ms: 0 in steady state (ANR leading indicator) | `MainThreadBlockingMetric` on every test |
+| Stability | Play bad-behaviour thresholds: user-perceived **crash rate < 1.09%**, **ANR rate < 0.47%** overall (8% per phone model) | `NoAnrOrCrashRule` in every benchmark; Play vitals in production |
+| Send latency | Tap → bubble: 0 ms (optimistic); tap → ✓ p95 < 500 ms on 4G | Product metric (§12) |
+| Battery | No background socket, no wakelocks; work batched by WorkManager | Design (§10.8); `PowerMetric` on rail-equipped Pixels (roadmap) |
+| Size | Track APK size per release (SQLCipher alone is +2.0 MB on arm64) | Release checklist |
+
+### 17.2 How it's measured
+
+Pattern taken from my MyTradingApp project. Full details are in **[perf/README.md](perf/README.md)**.
+
+```bash
+perf/run-benchmarks.sh v1.1                          # same physical device every release
+perf/compare.py perf/results/v1.0 perf/results/v1.1  # Markdown diff; exits 1 on regression (CI gate)
+```
+
+| Piece | What it does |
+|---|---|
+| `benchmark` build type | `initWith(release)`: minified, non-debuggable (debug builds can be 10×+ slower and mean nothing), debug-signed. **Seeds a deterministic dataset**: 60 conversations plus a 2,000-message chat |
+| [`:benchmark`](benchmark/src/main/java/com/example/whatsapp/benchmark/ChatBenchmarks.kt) module | Macrobenchmark + UiAutomator: `startupCold/Warm`, `conversationListScrollJank`, `chatHistoryScrollJank`, `liveMessagesInOpenChat` |
+| Custom trace sections | `SyncEngine.applyFrame` (an **async** section, because the DB write resumes on another thread) and `ChatList.mapRows`, read with `TraceSectionMetric` |
+| `ReportDrawnWhen` | Marks time-to-full-display when real conversations (not the spinner) are on screen |
+| [`MainThreadBlockingMetric`](benchmark/src/main/java/com/example/whatsapp/benchmark/BenchmarkUtils.kt) | Perfetto SQL over main-thread top-level slices: the longest slice, and the count and total over 100 ms |
+| `NoAnrOrCrashRule` | Fails the test if a new ANR or crash appears in the system DropBox |
+| `testTagsAsResourceId` | Compose test tags become resource IDs, so UiAutomator finds `conversation_row`, `messages_list`, `composer_input`… |
+| `profileinstaller` + `CompilationMode.DEFAULT` | Uses a Baseline Profile when one exists, so the benchmarks measure what users get |
+| Debug **StrictMode** | Logs main-thread disk/network access and leaked closeables / SQLite objects during development |
+| [`docs/capture-screenshots.sh`](docs/capture-screenshots.sh) | Reproducible README screenshots (demo-mode status bar, taps by text/ID, never by coordinates) |
+
+### 17.3 Performance decisions in this app, and their costs
+
+| Decision | Why it's fast | Cost / trade-off |
+|---|---|---|
+| **Paging 3** from Room (page 50, prefetch 20), `reverseLayout` | Memory stays bounded at any chat length; only visible pages are queried | Room's PagingSource uses offset paging: jumping to a search result deep in history needs a custom keyset `PagingSource` |
+| **Stable `key` + `contentType`** per item; immutable models; content-based `equals` for `ByteArray` thumbnails | Compose reuses item slots, and diffing doesn't recompose unchanged bubbles | Hand-written `equals`/`hashCode` to maintain |
+| **Upload/download progress in memory**, not in Room | Avoids invalidating the PagingSource 30–60×/s (a re-query storm) | Progress is lost on process death (WorkManager `setProgress` if it must survive) |
+| Per-row live observation **only for in-flight media** (§1.3) | Fixes a stale-UI race without a global cost | One extra observer per *visible* unsettled bubble |
+| **Indices** `(conversation_id, created_at)` and `(is_outgoing, status)`; **WAL** | Paging and outbox queries are index range scans; readers don't block the writer | Slightly slower inserts; WAL file to checkpoint |
+| Conversation list = **one query with correlated subqueries** | Simple and always consistent | O(conversations × lookup) per emission; at thousands of chats, **denormalize** `last_message_id`/`unread_count` (faster reads, more complex writes) |
+| **Image downscale** (`inSampleSize`, 1600 px) before decoding, plus Coil decoding at display size | Avoids a 48 MB ARGB bitmap per camera photo; ~75% fewer upload bytes | CPU at send time (off the main thread, on IO) |
+| **Micro-thumbnail inline** in the message | The bubble renders instantly with zero I/O | ~1–3 KB per media message on the socket and in the DB |
+| **Off-main-thread by construction**: media prep on IO, sync on Default, Room on its own executors; app-scoped work outlives screens | Main thread only renders | More concurrency to reason about (single-writer patterns, cursor in the same transaction) |
+| **One transaction per server frame** (and for the seed) | One fsync per frame instead of one per row | Larger transactions hold the write lock longer (fine at this size) |
+| **Socket only in the foreground**, FCM in the background | No background radio/CPU wakeups (battery) | Background delivery depends on push latency |
+| **Security on the hot path** (§16): SQLCipher library load + Keystore unwrap at startup, SQLCipher query overhead, SHA-256 per download | Protects data at rest and media integrity | **Measured: 67 ms + 43 ms on the cold-start main thread** (emulator), 88% of app init; per-frame DB commits ~2.4 ms. Mitigations: open the DB lazily off the main thread; hash while streaming the download |
+
+### 17.4 Results (emulator smoke run)
+
+Measured on a **software-rendered emulator** (`sdk_gphone64_arm64`, API 32, SwiftShader GPU). These
+runs prove the suite and pipeline work. **Absolute frame numbers are not meaningful** (every frame
+renders on the CPU), so real budgets must be checked on a physical mid-tier phone. Raw data is in
+`perf/results/emulator-smoke/`.
+
+| Scenario | Key metrics (median, or P90 for frames) | Reading |
+|---|---|---|
+| `startupCold` | TTID **1,039 ms**, TTFD **2,280 ms**; longest main-thread slice **420 ms** | The longest slice is the **first Compose frame**: the Perfetto trace shows `Choreographer#doFrame` at 420–546 ms, bigger than `bindApplication` (311 ms). Unprofiled (JIT) Compose code is the main lever, so **Baseline Profiles** come first in the roadmap |
+| ↳ app init on main thread | `appInitMaxMs` **125 ms**, of which `loadSqlcipherMaxMs` **67 ms** + `keyUnwrapMaxMs` **43 ms** | **88% of app init is the security work** (§16), measured instead of guessed. Fix: open the DB lazily off the main thread (the Keystore unwrap and native-library load move to a background thread) |
+| `startupWarm` | TTID **197 ms**, TTFD **304 ms** | Process already warm; DB already open |
+| `conversationListScrollJank` | `frameOverrunMs` P90 55.7 ms; longest main-thread slice 42.9 ms | Emulator-bound; **no slice > 100 ms**, so no ANR risk |
+| `chatHistoryScrollJank` | `frameOverrunMs` P90 65.2 ms; longest slice 52.7 ms | Paging loads during flings never block the main thread for > 100 ms |
+| `liveMessagesInOpenChat` | `applyFrameAverageMs` **2.4 ms**, `applyFrameMaxMs` 11.2 ms over **18** frames per iteration | Validating and committing a server frame (encrypted DB, one transaction) costs ~2 ms off the main thread, far below a 16 ms frame budget |
+
+The regression gate was verified too. Comparing these results against a copy with cold-start TTFD
+inflated by 30% makes `compare.py` print `🔴 REGRESSION` and **exit 1**, while workload counters
+(`frameCount`, `applyFrameCount`) are correctly never flagged.
+
+### 17.5 What building the suite taught me (interview stories)
+
+1. **`UiObject2.fling()` idles 5 s per gesture on Compose.** It waits for a `TYPE_VIEW_SCROLLED`
+   accessibility event that `LazyColumn` doesn't send. Logcat showed `Expected event not received
+   within: 5000 ms` on every fling. Switching to `UiDevice.swipe()` cut the scroll tests from
+   **118 s → 34 s** and **86 s → 23 s** per pass, with identical gestures. Lesson: profile the
+   *harness* too, because slow suites stop getting run.
+2. **Seeding must happen outside the measured block.** The first launch of the benchmark build seeds
+   2,000 rows. If the first startup iteration did that, every startup number would be skewed.
+   `@Before ensureDatasetSeeded()` does it once, unmeasured.
+3. **Async trace sections for suspending work.** `trace("x") { suspendCall() }` produces a broken
+   slice if the coroutine resumes on another thread. `SyncEngine.applyFrame` uses
+   `beginAsyncSection`/`endAsyncSection` with a cookie.
+4. **`TraceSectionMetric` appends the mode to your label.** `label = "applyFrameCount"` produced
+   `applyFrameCountCount`, so `compare.py`'s list of informational (never-flagged) metrics silently
+   stopped matching, and the counter could be reported as a regression. Labels are now bare
+   (`"applyFrame"` → `applyFrameAverageMs` / `applyFrameMaxMs` / `applyFrameCount`).
+5. **Read the trace before blaming a component.** My first guess was that the DB encryption caused
+   the 450 ms main-thread block at cold start. The Perfetto trace showed it was the first Compose
+   frame, and adding trace sections put the security cost at 110 of the 125 ms of app init. Both
+   findings changed the roadmap order.
+6. **Benchmark the shipped configuration.** The suite runs on a minified, non-debuggable build with
+   the same SQLCipher DB users get, so the cost of the security features (§16) is part of the numbers
+   instead of an untested assumption.
+
+### 17.6 Roadmap
+
+| Next step | Benefit | Trade-off |
+|---|---|---|
+| **Baseline Profile generator** (`androidx.baselineprofile` plugin + generator test over the startup → open chat → scroll journey) | Typically ~20–30% faster startup and less early jank via AOT compilation of the hot paths | Another module; profiles must be regenerated as code changes (CI job) |
+| **JankStats + Play vitals** in production, sliced by device tier | Real-user jank and startup, not just the lab | Telemetry volume; sample on low-end devices |
+| **Compose compiler stability reports** | Find unstable parameters that cause needless recomposition | Build-time cost; reports need triage |
+| **Lazy, off-main DB open** (move Keystore unwrap + SQLCipher key derivation off the startup path) | Lower TTID | The first query must await the DB; more complex DI |
+| **Memory & power metrics** (`MemoryUsageMetric`, `PowerMetric` on rail-equipped Pixels); LeakCanary in debug | Catch leaks and battery regressions | Power metrics need specific hardware |
+| **Per-ABI splits / App Bundle**, R8 full mode | Smaller download (SQLCipher ships for one ABI only) | Release-pipeline work |
+| **Denormalized conversation list**, keyset paging | Constant-time list emissions at thousands of chats; jump-to-message | More complex writes / custom PagingSource |
+
+### 17.7 Talk track (45 seconds)
+
+> "Performance has budgets and guards. I benchmark a minified, release-like build against a
+> deterministic dataset (2,000-message chat, 60 conversations) with Macrobenchmark: cold/warm
+> startup to *full* display, scroll jank on both lists including Paging loads, and live traffic
+> with a custom trace section around applying each server frame. Every test also records the
+> longest main-thread slice as an ANR early warning and fails on any ANR or crash. Results are
+> archived per release and `compare.py` fails CI on regressions over a threshold. Design-wise the
+> big levers are Paging with stable keys, keeping high-frequency state like progress out of the
+> database, downscaling images before decode, and keeping all I/O off the main thread. And I
+> measure the cost of security instead of guessing it: SQLCipher and the Keystore unwrap sit on the
+> startup path, and the startup benchmark covers them."
